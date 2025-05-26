@@ -1,0 +1,12 @@
+Project Description
+
+The Sports Allocation System is a robust application designed to streamline the management of sports teams and related activities within an educational or organizational environment. By leveraging role-based access control, the system ensures that users with different roles—such as Students, Captains, Coaches, and Admins—have tailored access to functionalities pertinent to their responsibilities.
+
+The system facilitates seamless user registration and authentication, enabling secure login and management of user credentials. It supports comprehensive role management, allowing administrators to assign and regulate user permissions efficiently.
+
+Central to the application is the dynamic allocation and management of teams and sports, where authorized users can create, update, and organize teams, assign sports, and manage team membership. The system provides full CRUD (Create, Read, Update, Delete) operations to maintain accurate and up-to-date records of users, teams, and sports data.
+
+A secure, well-documented RESTful API layer enables smooth interaction between the frontend and backend, ensuring data integrity and protecting sensitive information through authentication and authorization protocols.
+
+This project aims to reduce manual effort, minimize errors, and improve transparency and accountability in sports management activities through an intuitive, scalable, and secure platform.
+

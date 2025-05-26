@@ -1,0 +1,13 @@
+Sports Allocation System
+
+This project automates sports data management using role-based access control. It includes:
+
+User Registration & Login: Secure sign-up and authentication for different users.
+
+Role Management: Defines roles like Student, Captain, Coach, and Admin with specific permissions.
+
+Team & Sport Allocation: Manage teams and assign sports dynamically.
+
+CRUD Operations: Create, read, update, and delete users, teams, and sports data.
+
+Secure APIs: RESTful APIs with authentication to ensure safe data handling.

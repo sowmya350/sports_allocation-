@@ -1,0 +1,943 @@
+APP.PY 
+from flask import Flask, request, jsonify, send_from_directory
+from flask_mysqldb import MySQL
+from flask_bcrypt import Bcrypt
+from flask_cors import CORS
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from datetime import timedelta, datetime
+import os
+
+app = Flask(__name__)
+bcrypt = Bcrypt(app)
+CORS(app)
+jwt = JWTManager(app)
+
+# Config (Change your local MySQL credentials)
+app.config['JWT_SECRET_KEY'] = 'my_sports_secret_key'
+app.config['MYSQL_USER'] = 'root'
+app.config['MYSQL_PASSWORD'] = 'Sowmya@1234'
+app.config['MYSQL_DB'] = 'sports_allocation'
+app.config['MYSQL_HOST'] = 'localhost'
+
+mysql = MySQL(app)
+
+# Serve frontend HTML file
+@app.route('/')
+def serve_frontend():
+    return send_from_directory('.', 'registration.html')
+
+# ------------------ User Registration with Role and Slot Check ------------------
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.json
+    username = data.get('username')
+    emailid = data.get('emailid')
+    phone = data.get('phone')
+    password = data.get('password')
+    dob = data.get('dob')
+    interested_sport = data.get('interested_sport')
+    role = data.get('role')
+    experience = data.get('experience')
+    registration_date = datetime.now()
+
+    # Validate required fields
+    if not all([username, emailid, password, interested_sport, role]):
+        return jsonify({'error': 'Missing required fields'}), 400
+
+    cur = mysql.connection.cursor()
+
+    try:
+        # Check if user already exists
+        cur.execute("SELECT userid FROM user WHERE emailid = %s", (emailid,))
+        if cur.fetchone():
+            return jsonify({'error': 'Email already registered'}), 409
+
+        # Verify sport exists
+        cur.execute("SELECT sportid FROM sports WHERE sportname = %s", (interested_sport,))
+        sport = cur.fetchone()
+        if not sport:
+            return jsonify({'error': 'Invalid sport selected'}), 400
+        sport_id = sport[0]
+
+        # Check role availability
+        cur.execute("""
+            SELECT sr.max_slots, 
+                   (SELECT COUNT(*) FROM user 
+                    WHERE interested_sport = %s AND role = %s) AS current_count
+            FROM sport_roles sr
+            WHERE sr.sport_id = %s AND sr.role_name = %s
+        """, (interested_sport, role, sport_id, role))
+        role_data = cur.fetchone()
+
+        if not role_data:
+            return jsonify({'error': 'Invalid role for this sport'}), 400
+        
+        max_slots, current_count = role_data
+        if current_count >= max_slots:
+            return jsonify({'error': f'No slots left for {role} in {interested_sport}'}), 400
+
+        # Hash password
+        hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
+
+        # Insert new user (userid will auto-increment)
+        cur.execute("""
+            INSERT INTO user (
+                username, emailid, phone, password, 
+                dob, interested_sport, role, experience, registration_date
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (username, emailid, phone, hashed_password, 
+              dob, interested_sport, role, experience, registration_date))
+        
+        mysql.connection.commit()
+        
+        # Get the auto-generated userid
+        new_userid = cur.lastrowid
+        
+        return jsonify({
+            'message': 'Registration successful!',
+            'userid': new_userid,
+            'username': username,
+            'role': role
+        }), 201
+
+    except Exception as e:
+        mysql.connection.rollback()
+        return jsonify({'error': f'Database error: {str(e)}'}), 500
+        
+    finally:
+        cur.close()
+
+# ------------------ User Login ------------------
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    emailid = data.get('emailid')
+    password = data.get('password')
+
+    if not all([emailid, password]):
+        return jsonify({'error': 'Email and password required'}), 400
+
+    cur = mysql.connection.cursor()
+    
+    try:
+        # Get user from database including role
+        cur.execute("""
+            SELECT userid, username, password, role 
+            FROM user 
+            WHERE emailid = %s
+        """, (emailid,))
+        user = cur.fetchone()
+
+        if not user:
+            return jsonify({'error': 'Invalid credentials'}), 401
+
+        userid, username, password_hash, role = user
+        
+        # Verify password
+        if not bcrypt.check_password_hash(password_hash, password):
+            return jsonify({'error': 'Invalid credentials'}), 401
+
+        # Create JWT token
+        access_token = create_access_token(
+            identity=str(userid),
+            additional_claims={'role': role},
+            expires_delta=timedelta(hours=24))
+        
+        return jsonify({
+            'message': 'Login successful',
+            'token': access_token,
+            'userid': userid,
+            'username': username,
+            'role': role
+        }), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+# ------------------ User Profile ------------------
+@app.route('/profile', methods=['GET'])
+@jwt_required()
+def profile():
+    current_user = get_jwt_identity()
+    cur = mysql.connection.cursor()
+    cur.execute("""
+        SELECT userid, username, emailid, phone, dob, interested_sport, role, experience, registration_date 
+        FROM user WHERE userid = %s
+    """, (current_user,))
+    row = cur.fetchone()
+    if row:
+        keys = ['userid', 'username', 'emailid', 'phone', 'dob', 'interested_sport', 'role', 'experience', 'registration_date']
+        return jsonify(dict(zip(keys, row)))
+    else:
+        return jsonify({'error': 'User not found'}), 404
+
+# ------------------ View All Sports ------------------
+@app.route('/sports', methods=['GET'])
+def viewallsports():
+    cur = mysql.connection.cursor()
+    cur.execute("SELECT sportid, sportname, description FROM sports")
+    rows = cur.fetchall()
+    sports = [{'sportid': r[0], 'sportname': r[1], 'description': r[2]} for r in rows]
+    return jsonify(sports), 200
+
+# ------------------ Get Roles for a Sport ------------------
+@app.route('/available_roles/<sportname>', methods=['GET'])
+def available_roles(sportname):
+    cur = mysql.connection.cursor()
+    
+    try:
+        # Get sport ID
+        cur.execute("SELECT sportid FROM sports WHERE sportname = %s", (sportname,))
+        sport = cur.fetchone()
+        if not sport:
+            return jsonify({'error': 'Sport not found'}), 404
+        sport_id = sport[0]
+
+        # Get all standard player roles AND coach roles
+        cur.execute("""
+            SELECT sr.role_name, sr.max_slots,
+                   (SELECT COUNT(*) FROM user 
+                    WHERE interested_sport = %s AND role = sr.role_name) AS current_count
+            FROM sport_roles sr
+            WHERE sr.sport_id = %s
+            
+            UNION ALL
+            
+            SELECT 'Coach' as role_name, 
+                   3 as max_slots,  -- Adjust this number for desired coach slots
+                   (SELECT COUNT(*) FROM user 
+                    WHERE interested_sport = %s AND role = 'Coach') AS current_count
+        """, (sportname, sport_id, sportname))
+        
+        roles_data = cur.fetchall()
+
+        available_roles = []
+        for role_name, max_slots, current_count in roles_data:
+            slots_left = max_slots - current_count
+            available_roles.append({
+                'role_name': role_name,
+                'max_slots': max_slots,
+                'slots_left': slots_left,
+                'status': 'Available' if slots_left > 0 else 'Blocked'
+            })
+
+        return jsonify({
+            'sport': sportname,
+            'roles': available_roles
+        }), 200
+
+    except Exception as e:
+        return jsonify({'error': f'Database error: {str(e)}'}), 500
+        
+    finally:
+        cur.close()
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
+
+
+
+SQL CODE:
+CREATE DATABASE IF NOT EXISTS sports_allocation;
+USE sports_allocation;
+
+-- Drop all tables if they exist to avoid conflicts
+DROP TABLE IF EXISTS captain;
+DROP TABLE IF EXISTS coach;
+DROP TABLE IF EXISTS team_members;
+DROP TABLE IF EXISTS team;
+DROP TABLE IF EXISTS user;
+DROP TABLE IF EXISTS sport_roles;
+DROP TABLE IF EXISTS sports;
+
+-- Create sports table
+CREATE TABLE sports (
+    sportid INT AUTO_INCREMENT PRIMARY KEY,
+    sportname VARCHAR(100) NOT NULL UNIQUE,
+    description TEXT
+);
+select * from sports;
+-- Create sport_roles table
+CREATE TABLE sport_roles (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    sport_id INT NOT NULL,
+    role_name VARCHAR(100) NOT NULL,
+    max_slots INT NOT NULL,
+    FOREIGN KEY (sport_id) REFERENCES sports(sportid) ON DELETE CASCADE,
+    UNIQUE KEY unique_role_per_sport (sport_id, role_name)
+);
+select * from sport_roles;
+-- Create user table
+CREATE TABLE user (
+    userid INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(100) NOT NULL,
+    emailid VARCHAR(100) NOT NULL UNIQUE,
+    phone VARCHAR(15),
+    password VARCHAR(255) NOT NULL,
+    profileid VARCHAR(50),
+    dob DATE,
+    interested_sport VARCHAR(100),
+    role VARCHAR(50),
+    experience VARCHAR(100),
+    registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+select * from user;
+-- Create team table
+CREATE TABLE team (
+    teamid INT AUTO_INCREMENT PRIMARY KEY,
+    teamname VARCHAR(100) NOT NULL,
+    sport_id INT NOT NULL,
+    coachid INT,
+    captainid INT,
+    FOREIGN KEY (sport_id) REFERENCES sports(sportid) ON DELETE CASCADE
+);
+select * from team;
+-- Create team_members table
+CREATE TABLE team_members (
+    teamid INT NOT NULL,
+    userid INT NOT NULL,
+    role VARCHAR(50) NOT NULL,
+    joined_date DATE NOT NULL,
+    PRIMARY KEY (teamid, userid),
+    FOREIGN KEY (teamid) REFERENCES team(teamid) ON DELETE CASCADE,
+    FOREIGN KEY (userid) REFERENCES user(userid) ON DELETE CASCADE
+);
+select * from team_members;
+-- Create coach table
+CREATE TABLE coach (
+    coachid INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100),
+    phone VARCHAR(15),
+    sport_id INT,
+    FOREIGN KEY (sport_id) REFERENCES sports(sportid) ON DELETE CASCADE
+);
+select * from coach;
+-- Create captain table (optional)
+CREATE TABLE captain (
+    captainid INT AUTO_INCREMENT PRIMARY KEY,
+    userid INT NOT NULL,
+    teamid INT NOT NULL,
+    FOREIGN KEY (userid) REFERENCES user(userid) ON DELETE CASCADE,
+    FOREIGN KEY (teamid) REFERENCES team(teamid) ON DELETE CASCADE
+);
+select * from captain;
+-- Insert sports data
+INSERT INTO sports (sportname, description) VALUES
+('Kabaddi', 'A team sport with defenders, raiders, and a captain'),
+('Football', 'A team sport with goalkeeper, forward, defender, midfielder'),
+('Basketball', 'Fast-paced court game with guards, forwards, center'),
+('Cricket', 'Batting and bowling roles'),
+('Volleyball', 'Spikers, blockers, liberos, setters'),
+('Badminton', 'Singles and doubles play'),
+('Table Tennis', 'Singles and doubles'),
+('Hockey', 'Forwards, defenders, goalkeeper'),
+('Throwball', 'Similar to volleyball with setters and attackers'),
+('Kho-Kho', 'Chasers, defenders');
+select * from sports;
+-- Insert sport roles with max slot limits
+INSERT INTO sport_roles (sport_id, role_name, max_slots) VALUES
+-- Kabaddi
+(1, 'Raider', 2), (1, 'Defender', 4), (1, 'Captain', 1),
+-- Football
+(2, 'Goalkeeper', 1), (2, 'Defender', 4), (2, 'Midfielder', 4), (2, 'Forward', 3),
+-- Basketball
+(3, 'Guard', 2), (3, 'Forward', 2), (3, 'Center', 1),
+-- Cricket
+(4, 'Batsman', 4), (4, 'Bowler', 4), (4, 'Wicket Keeper', 1), (4, 'Captain', 1),
+-- Volleyball
+(5, 'Spiker', 3), (5, 'Blocker', 2), (5, 'Libero', 1), (5, 'Setter', 1),
+-- Badminton
+(6, 'Singles', 1), (6, 'Doubles', 2),
+-- Table Tennis
+(7, 'Singles', 1), (7, 'Doubles', 2),
+-- Hockey
+(8, 'Forward', 3), (8, 'Defender', 3), (8, 'Goalkeeper', 1),
+-- Throwball
+(9, 'Setter', 2), (9, 'Attacker', 3),
+-- Kho-Kho
+(10, 'Chaser', 4), (10, 'Defender', 4);
+select * from sport_roles;
+ALTER TABLE user DROP COLUMN profileid;
+-- For each sport (example for sportid=1):
+INSERT INTO sport_roles (sport_id, role_name, max_slots) 
+VALUES (1, 'Coach', 3);  -- 3 coach slots per team
+DESCRIBE user;
+
+
+
+
+
+LOGIN.HTML
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sports Login</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 400px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .login-container {
+            background: white;
+            padding: 25px;
+            border-radius: 8px;
+            box-shadow: 0 0 15px rgba(0,0,0,0.1);
+        }
+        h2 {
+            color: #2c3e50;
+            text-align: center;
+            margin-bottom: 25px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+            color: #34495e;
+        }
+        input[type="text"],
+        input[type="password"] {
+            width: 100%;
+            padding: 12px;
+            margin-bottom: 20px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+            font-size: 16px;
+        }
+        button {
+            background-color: #3498db;
+            color: white;
+            padding: 12px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            width: 100%;
+            font-size: 16px;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #2980b9;
+        }
+        #loginMsg {
+            margin: 15px 0;
+            text-align: center;
+            min-height: 20px;
+        }
+        .register-section {
+            text-align: center;
+            margin-top: 20px;
+            padding-top: 15px;
+            border-top: 1px solid #eee;
+        }
+        .register-link {
+            color: #3498db;
+            text-decoration: none;
+            font-weight: bold;
+        }
+        .register-link:hover {
+            text-decoration: underline;
+        }
+        .error {
+            color: #e74c3c;
+        }
+        .success {
+            color: #27ae60;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <h2>Sports Allocation Login</h2>
+        <form id="loginForm">
+            <label>Email:
+                <input type="text" id="emailid" required placeholder="Enter your email">
+            </label>
+            
+            <label>Password:
+                <input type="password" id="password" required placeholder="Enter your password">
+            </label>
+            
+            <button type="submit">Login</button>
+            <p id="loginMsg"></p>
+        </form>
+
+        <div class="register-section">
+            <span>Don't have an account? </span>
+            <a href="registration.html" class="register-link">Register here</a>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById("loginForm").addEventListener("submit", function(e) {
+            e.preventDefault();
+            const msg = document.getElementById("loginMsg");
+            msg.textContent = "";
+            msg.className = "";
+
+            const email = document.getElementById("emailid").value.trim();
+            const password = document.getElementById("password").value;
+
+            fetch("http://localhost:5000/login", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    emailid: email,
+                    password: password
+                })
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('Login failed');
+                }
+                return response.json();
+            })
+            .then(data => {
+                if (data.token) {
+                    // Store token and user data
+                    localStorage.setItem("access_token", data.token);
+                    localStorage.setItem("userid", data.userid);
+                    localStorage.setItem("username", data.username);
+                    localStorage.setItem("role", data.role);
+                    
+                    // Show success message
+                    msg.textContent = "Login successful! Redirecting...";
+                    msg.className = "success";
+                    
+                    // Force redirect after 1 second
+                    setTimeout(() => {
+                        window.location.href = "profile.html";
+                    }, 1000);
+                } else {
+                    throw new Error(data.message || 'Invalid credentials');
+                }
+            })
+            .catch(error => {
+                msg.textContent = error.message || "Login failed. Please try again.";
+                msg.className = "error";
+            });
+        });
+    </script>
+</body>
+</html>
+
+
+REGISTRATION.HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Sports Registration</title>
+  <style>
+    body { 
+      font-family: Arial, sans-serif; 
+      max-width: 600px; 
+      margin: 20px auto; 
+      padding: 20px;
+      background-color: #f5f5f5;
+    }
+    .registration-container {
+      background: white;
+      padding: 25px;
+      border-radius: 8px;
+      box-shadow: 0 0 15px rgba(0,0,0,0.1);
+    }
+    h2 {
+      color: #2c3e50;
+      text-align: center;
+      margin-bottom: 25px;
+    }
+    label { 
+      display: block; 
+      margin-top: 15px;
+      color: #34495e;
+      font-weight: bold;
+    }
+    input, select { 
+      width: 100%; 
+      padding: 12px; 
+      margin-top: 5px; 
+      box-sizing: border-box;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      font-size: 16px;
+    }
+    button { 
+      background: #3498db; 
+      color: white; 
+      border: none; 
+      padding: 12px; 
+      margin-top: 20px; 
+      cursor: pointer;
+      width: 100%;
+      font-size: 16px;
+      border-radius: 4px;
+      transition: background-color 0.3s;
+    }
+    button:hover { 
+      background: #2980b9; 
+    }
+    .message { 
+      margin-top: 20px; 
+      padding: 10px; 
+      border-radius: 4px;
+      text-align: center;
+    }
+    .success { 
+      background: #dff0d8; 
+      color: #3c763d; 
+    }
+    .error { 
+      background: #f2dede; 
+      color: #a94442; 
+    }
+    .login-section {
+      text-align: center;
+      margin-top: 20px;
+      padding-top: 15px;
+      border-top: 1px solid #eee;
+    }
+    .login-link {
+      color: #3498db;
+      text-decoration: none;
+      font-weight: bold;
+    }
+    .login-link:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <div class="registration-container">
+    <h2>Sports Registration</h2>
+    <form id="registrationForm">
+      <label>Username: 
+        <input type="text" id="username" required placeholder="Enter your username">
+      </label>
+      
+      <label>Email: 
+        <input type="email" id="emailid" required placeholder="Enter your email">
+      </label>
+      
+      <label>Phone: 
+        <input type="tel" id="phone" placeholder="Enter your phone number">
+      </label>
+      
+      <label>Password: 
+        <input type="password" id="password" required placeholder="Create a password">
+      </label>
+      
+      <label>Date of Birth: 
+        <input type="date" id="dob">
+      </label>
+      
+      <label>Experience (years): 
+        <input type="number" id="experience" min="0" placeholder="Years of experience">
+      </label>
+      
+      <label>Sport:
+        <select id="sportSelect" required>
+          <option value="">Select Sport</option>
+        </select>
+      </label>
+      
+      <label>Role:
+        <select id="roleSelect" required>
+          <option value="">Select Role</option>
+        </select>
+      </label>
+      
+      <button type="submit">Register</button>
+    </form>
+    
+    <div id="message" class="message"></div>
+
+    <div class="login-section">
+      <span>Already have an account? </span>
+      <a href="login.html" class="login-link">Login here</a>
+    </div>
+  </div>
+
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      const sportSelect = document.getElementById('sportSelect');
+      const roleSelect = document.getElementById('roleSelect');
+      const messageDiv = document.getElementById('message');
+      
+      // Load sports on page load
+      fetch('http://localhost:5000/sports')
+        .then(res => res.json())
+        .then(sports => {
+          sports.forEach(sport => {
+            const option = document.createElement('option');
+            option.value = sport.sportname;
+            option.textContent = sport.sportname;
+            sportSelect.appendChild(option);
+          });
+        })
+        .catch(err => showMessage('Error loading sports', 'error'));
+      
+      // Update roles when sport changes
+      sportSelect.addEventListener('change', function() {
+        roleSelect.innerHTML = '<option value="">Select Role</option>';
+        messageDiv.textContent = '';
+        
+        if (!this.value) return;
+        
+        fetch(`http://localhost:5000/available_roles/${this.value}`)
+          .then(res => res.json())
+          .then(data => {
+            data.roles.forEach(role => {
+              const option = document.createElement('option');
+              option.value = role.role_name;
+              option.textContent = `${role.role_name} (${role.slots_left} slots left)`;
+              option.disabled = role.status === 'Blocked';
+              roleSelect.appendChild(option);
+            });
+          })
+          .catch(err => showMessage('Error loading roles', 'error'));
+      });
+      
+      // Handle form submission
+      document.getElementById('registrationForm').addEventListener('submit', function(e) {
+        e.preventDefault();
+        messageDiv.textContent = '';
+        
+        const formData = {
+          username: document.getElementById('username').value.trim(),
+          emailid: document.getElementById('emailid').value.trim(),
+          phone: document.getElementById('phone').value.trim(),
+          password: document.getElementById('password').value,
+          dob: document.getElementById('dob').value,
+          interested_sport: sportSelect.value,
+          role: roleSelect.value,
+          experience: document.getElementById('experience').value
+        };
+        
+        fetch('http://localhost:5000/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(formData)
+        })
+        .then(res => res.json())
+        .then(data => {
+          if (data.error) throw new Error(data.error);
+          showMessage(data.message || 'Registration successful!', 'success');
+          this.reset();
+          roleSelect.innerHTML = '<option value="">Select Role</option>';
+        })
+        .catch(err => showMessage(err.message || 'Registration failed', 'error'));
+      });
+      
+      function showMessage(msg, type) {
+        messageDiv.textContent = msg;
+        messageDiv.className = 'message ' + type;
+      }
+    });
+  </script>
+</body>
+</html>
+
+
+PROFILE.HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>My Sports Profile</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .profile-container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 0 15px rgba(0,0,0,0.1);
+        }
+        h2 {
+            color: #2c3e50;
+            text-align: center;
+            margin-bottom: 30px;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 10px;
+        }
+        .profile-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .profile-details {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        .detail-group {
+            margin-bottom: 15px;
+        }
+        .detail-label {
+            font-weight: bold;
+            color: #34495e;
+            margin-bottom: 5px;
+        }
+        .detail-value {
+            padding: 10px;
+            background: #f9f9f9;
+            border-radius: 4px;
+            border-left: 4px solid #3498db;
+        }
+        .sport-badge {
+            display: inline-block;
+            padding: 5px 10px;
+            background: #3498db;
+            color: white;
+            border-radius: 20px;
+            font-size: 14px;
+        }
+        .role-badge {
+            display: inline-block;
+            padding: 5px 10px;
+            background: #2ecc71;
+            color: white;
+            border-radius: 20px;
+            font-size: 14px;
+        }
+        .logout-btn {
+            background: #e74c3c;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background-color 0.3s;
+        }
+        .logout-btn:hover {
+            background: #c0392b;
+        }
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #7f8c8d;
+        }
+        .error {
+            color: #e74c3c;
+            text-align: center;
+            padding: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="profile-container">
+        <h2>My Sports Profile</h2>
+        <div id="profile-content">
+            <div class="loading">Loading profile data...</div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const token = localStorage.getItem('access_token');
+            const profileContent = document.getElementById('profile-content');
+            
+            // Check if user is logged in
+            if (!token) {
+                window.location.href = 'login.html';
+                return;
+            }
+            
+            // Load profile data
+            fetch('http://localhost:5000/profile', {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${token}`
+                }
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('Failed to load profile');
+                }
+                return response.json();
+            })
+            .then(data => {
+                // Display profile data
+                const profileHtml = `
+                    <div class="profile-header">
+                        <h3>Welcome, ${data.username} ${data.role === 'Coach' ? '<span style="color:#e67e22">(Coach)</span>' : ''}</h3>
+                        <button class="logout-btn" id="logoutBtn">Logout</button>
+                    </div>
+                    <div class="profile-details">
+                        <div class="detail-group">
+                            <div class="detail-label">Email</div>
+                            <div class="detail-value">${data.emailid || 'Not provided'}</div>
+                        </div>
+                        
+                        <div class="detail-group">
+                            <div class="detail-label">Phone</div>
+                            <div class="detail-value">${data.phone || 'Not provided'}</div>
+                        </div>
+                        
+                        <div class="detail-group">
+                            <div class="detail-label">Date of Birth</div>
+                            <div class="detail-value">${data.dob || 'Not provided'}</div>
+                        </div>
+                        
+                        <div class="detail-group">
+                            <div class="detail-label">Experience</div>
+                            <div class="detail-value">${data.experience ? data.experience + ' years' : 'Not provided'}</div>
+                        </div>
+                        
+                        <div class="detail-group">
+                            <div class="detail-label">Sport</div>
+                            <div class="detail-value">
+                                <span class="sport-badge">${data.interested_sport || 'Not selected'}</span>
+                            </div>
+                        </div>
+                        
+                        <div class="detail-group">
+                            <div class="detail-label">Role</div>
+                            <div class="detail-value">
+                                <span class="role-badge">${data.role || 'Not selected'}</span>
+                            </div>
+                        </div>
+                        
+                        <div class="detail-group">
+                            <div class="detail-label">Member Since</div>
+                            <div class="detail-value">${new Date(data.registration_date).toLocaleDateString()}</div>
+                        </div>
+                        
+                        <div class="detail-group">
+                            <div class="detail-label">User ID</div>
+                            <div class="detail-value">${data.userid}</div>
+                        </div>
+                    </div>
+                `;
+                
+                profileContent.innerHTML = profileHtml;
+                
+                // Add logout functionality
+                document.getElementById('logoutBtn').addEventListener('click', function() {
+                    localStorage.removeItem('access_token');
+                    localStorage.removeItem('userid');
+                    localStorage.removeItem('username');
+                    localStorage.removeItem('role');
+                    window.location.href = 'login.html';
+                });
+            })
+            .catch(error => {
+                profileContent.innerHTML = `<div class="error">${error.message}. Please <a href="login.html">login</a> again.</div>`;
+            });
+        });
+    </script>
+</body>
+</html>
